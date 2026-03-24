@@ -4,10 +4,70 @@
 
 use reqwest::header::WWW_AUTHENTICATE;
 use reqwest::{RequestBuilder, Response, StatusCode};
+use std::future::Future;
+use std::pin::Pin;
 
 use super::error::HttpError;
 use super::provider::PaymentProvider;
-use crate::protocol::core::{format_authorization, parse_www_authenticate, AUTHORIZATION_HEADER};
+use crate::protocol::core::{
+    format_authorization, parse_www_authenticate, PaymentChallenge, PaymentCredential,
+    AUTHORIZATION_HEADER,
+};
+
+/// Result of an [`OnChallenge`] callback, mirroring mppx's 3-way return type.
+///
+/// - `Approve` — proceed with automatic payment via the provider (mppx: `undefined`)
+/// - `Credential(c)` — use this pre-built credential, skip the provider (mppx: `string`)
+/// - `Decline` — abort with [`HttpError::PaymentDeclined`] (mppx: `throw`)
+#[derive(Debug)]
+pub enum ChallengeAction {
+    /// Proceed with automatic payment via the provider.
+    Approve,
+    /// Use this credential directly, skipping the provider.
+    Credential(Box<PaymentCredential>),
+    /// Decline the payment.
+    Decline,
+}
+
+/// Callback invoked when a 402 challenge is received, before executing payment.
+///
+/// The callback receives the parsed [`PaymentChallenge`] and returns a
+/// [`ChallengeAction`] controlling how to proceed.
+///
+/// # Examples
+///
+/// ```ignore
+/// use mpp::client::{Fetch, OnChallenge, ChallengeAction};
+///
+/// // Simple approval gate
+/// let on_challenge: OnChallenge = Box::new(|challenge| {
+///     Box::pin(async move {
+///         if approve_payment(challenge).await {
+///             ChallengeAction::Approve
+///         } else {
+///             ChallengeAction::Decline
+///         }
+///     })
+/// });
+///
+/// // Or supply a credential directly (e.g. after gathering user input)
+/// let on_challenge: OnChallenge = Box::new(|challenge| {
+///     Box::pin(async move {
+///         let credential = create_credential_with_extra_context(challenge).await;
+///         ChallengeAction::Credential(Box::new(credential))
+///     })
+/// });
+///
+/// let resp = client
+///     .get("https://api.example.com/paid")
+///     .send_with_payment_opts(&provider, Some(&on_challenge))
+///     .await?;
+/// ```
+pub type OnChallenge = Box<
+    dyn Fn(&PaymentChallenge) -> Pin<Box<dyn Future<Output = ChallengeAction> + Send + '_>>
+        + Send
+        + Sync,
+>;
 
 /// Extension trait for `reqwest::RequestBuilder` with payment support.
 ///
@@ -48,12 +108,33 @@ pub trait PaymentExt {
         self,
         provider: &P,
     ) -> impl std::future::Future<Output = Result<Response, HttpError>> + Send;
+
+    /// Like [`send_with_payment`](PaymentExt::send_with_payment), but with an
+    /// optional [`OnChallenge`] callback invoked before payment execution.
+    ///
+    /// The callback returns a [`ChallengeAction`] controlling how to proceed:
+    /// - [`ChallengeAction::Approve`] — auto-pay via the provider
+    /// - [`ChallengeAction::Credential`] — use the provided credential directly
+    /// - [`ChallengeAction::Decline`] — abort with [`HttpError::PaymentDeclined`]
+    fn send_with_payment_opts<P: PaymentProvider>(
+        self,
+        provider: &P,
+        on_challenge: Option<&OnChallenge>,
+    ) -> impl std::future::Future<Output = Result<Response, HttpError>> + Send;
 }
 
 impl PaymentExt for RequestBuilder {
     async fn send_with_payment<P: PaymentProvider>(
         self,
         provider: &P,
+    ) -> Result<Response, HttpError> {
+        self.send_with_payment_opts(provider, None).await
+    }
+
+    async fn send_with_payment_opts<P: PaymentProvider>(
+        self,
+        provider: &P,
+        on_challenge: Option<&OnChallenge>,
     ) -> Result<Response, HttpError> {
         let retry_builder = self.try_clone().ok_or(HttpError::CloneFailed)?;
 
@@ -73,7 +154,15 @@ impl PaymentExt for RequestBuilder {
         let challenge = parse_www_authenticate(www_auth)
             .map_err(|e| HttpError::InvalidChallenge(e.to_string()))?;
 
-        let credential = provider.pay(&challenge).await?;
+        let credential = if let Some(cb) = on_challenge {
+            match cb(&challenge).await {
+                ChallengeAction::Approve => provider.pay(&challenge).await?,
+                ChallengeAction::Credential(c) => *c,
+                ChallengeAction::Decline => return Err(HttpError::PaymentDeclined),
+            }
+        } else {
+            provider.pay(&challenge).await?
+        };
 
         let auth_header = format_authorization(&credential)
             .map_err(|e| HttpError::InvalidCredential(e.to_string()))?;
@@ -321,6 +410,94 @@ mod tests {
                 .unwrap_err();
 
             assert!(matches!(err, HttpError::Payment(_)));
+        }
+
+        /// Helper: build a 402 server that accepts payment on retry.
+        fn paid_app(www_auth: String) -> Router {
+            Router::new().route(
+                "/paid",
+                get(move |req: axum::http::Request<axum::body::Body>| {
+                    let www_auth = www_auth.clone();
+                    async move {
+                        if req.headers().get("authorization").is_some() {
+                            (AxumStatusCode::OK, "ok").into_response()
+                        } else {
+                            (
+                                AxumStatusCode::PAYMENT_REQUIRED,
+                                [(WWW_AUTH_NAME, www_auth)],
+                                "pay up",
+                            )
+                                .into_response()
+                        }
+                    }
+                }),
+            )
+        }
+
+        #[tokio::test]
+        async fn test_on_challenge_approve() {
+            let (_, www_auth) = test_challenge();
+            let app = paid_app(www_auth);
+            let base_url = spawn_server(app).await;
+            let provider = MockProvider::new();
+
+            let on_challenge: super::OnChallenge =
+                Box::new(|_challenge| Box::pin(async { super::ChallengeAction::Approve }));
+
+            let resp = reqwest::Client::new()
+                .get(format!("{}/paid", base_url))
+                .send_with_payment_opts(&provider, Some(&on_challenge))
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(provider.call_count(), 1);
+        }
+
+        #[tokio::test]
+        async fn test_on_challenge_credential() {
+            let (challenge, www_auth) = test_challenge();
+            let app = paid_app(www_auth);
+            let base_url = spawn_server(app).await;
+            let provider = MockProvider::new();
+
+            let echo = challenge.to_echo();
+            let on_challenge: super::OnChallenge = Box::new(move |_challenge| {
+                let echo = echo.clone();
+                Box::pin(async move {
+                    let cred = PaymentCredential::new(echo, PaymentPayload::hash("0xcustom"));
+                    super::ChallengeAction::Credential(Box::new(cred))
+                })
+            });
+
+            let resp = reqwest::Client::new()
+                .get(format!("{}/paid", base_url))
+                .send_with_payment_opts(&provider, Some(&on_challenge))
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(provider.call_count(), 0); // provider was NOT called
+        }
+
+        #[tokio::test]
+        async fn test_on_challenge_decline() {
+            let (_, www_auth) = test_challenge();
+            let app = paid_app(www_auth);
+            let base_url = spawn_server(app).await;
+            let provider = MockProvider::new();
+
+            let on_challenge: super::OnChallenge =
+                Box::new(|_challenge| Box::pin(async { super::ChallengeAction::Decline }));
+
+            let err = reqwest::Client::new()
+                .get(format!("{}/paid", base_url))
+                .send_with_payment_opts(&provider, Some(&on_challenge))
+                .await
+                .unwrap_err();
+
+            assert!(matches!(err, HttpError::PaymentDeclined));
+            assert_eq!(provider.call_count(), 0);
         }
     }
 }
