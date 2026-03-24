@@ -8,6 +8,7 @@ use reqwest::header::WWW_AUTHENTICATE;
 use reqwest::{Request, Response, StatusCode};
 use reqwest_middleware::{Middleware, Next};
 
+use crate::client::fetch::{ChallengeAction, OnChallenge};
 use crate::client::provider::PaymentProvider;
 use crate::protocol::core::{
     format_authorization, parse_www_authenticate_all, AUTHORIZATION_HEADER,
@@ -37,12 +38,27 @@ use crate::protocol::core::{
 /// ```
 pub struct PaymentMiddleware<P> {
     provider: P,
+    on_challenge: Option<OnChallenge>,
 }
 
 impl<P> PaymentMiddleware<P> {
     /// Create a new payment middleware with the given provider.
     pub fn new(provider: P) -> Self {
-        Self { provider }
+        Self {
+            provider,
+            on_challenge: None,
+        }
+    }
+
+    /// Set an [`OnChallenge`] callback invoked before payment execution.
+    ///
+    /// The callback returns a [`ChallengeAction`] controlling how to proceed:
+    /// - [`ChallengeAction::Approve`] — auto-pay via the provider
+    /// - [`ChallengeAction::Credential`] — use the provided credential directly
+    /// - [`ChallengeAction::Decline`] — abort with a middleware error
+    pub fn with_on_challenge(mut self, on_challenge: OnChallenge) -> Self {
+        self.on_challenge = Some(on_challenge);
+        self
     }
 }
 
@@ -92,12 +108,28 @@ where
             .context("no challenge matches provider's supported methods")
             .map_err(reqwest_middleware::Error::Middleware)?;
 
-        let credential = self
-            .provider
-            .pay(challenge)
-            .await
-            .context("payment failed")
-            .map_err(reqwest_middleware::Error::Middleware)?;
+        let credential = if let Some(ref cb) = self.on_challenge {
+            match cb(challenge).await {
+                ChallengeAction::Approve => self
+                    .provider
+                    .pay(challenge)
+                    .await
+                    .context("payment failed")
+                    .map_err(reqwest_middleware::Error::Middleware)?,
+                ChallengeAction::Credential(c) => *c,
+                ChallengeAction::Decline => {
+                    return Err(reqwest_middleware::Error::Middleware(anyhow::anyhow!(
+                        "payment declined by on_challenge callback"
+                    )))
+                }
+            }
+        } else {
+            self.provider
+                .pay(challenge)
+                .await
+                .context("payment failed")
+                .map_err(reqwest_middleware::Error::Middleware)?
+        };
 
         let auth_header = format_authorization(&credential)
             .context("failed to format credential")
@@ -353,6 +385,110 @@ mod tests {
                 "expected payment failure, got: {}",
                 err
             );
+        }
+
+        /// Helper: build a 402 server that accepts payment on retry.
+        fn paid_app(www_auth: String) -> Router {
+            Router::new().route(
+                "/paid",
+                get(move |req: axum::http::Request<axum::body::Body>| {
+                    let www_auth = www_auth.clone();
+                    async move {
+                        if req.headers().get("authorization").is_some() {
+                            (AxumStatusCode::OK, "ok").into_response()
+                        } else {
+                            (
+                                AxumStatusCode::PAYMENT_REQUIRED,
+                                [(WWW_AUTH_NAME, www_auth)],
+                                "pay up",
+                            )
+                                .into_response()
+                        }
+                    }
+                }),
+            )
+        }
+
+        #[tokio::test]
+        async fn test_middleware_on_challenge_approve() {
+            let (_, www_auth) = test_challenge();
+            let app = paid_app(www_auth);
+            let base_url = spawn_server(app).await;
+            let provider = TestProvider::new();
+
+            let on_challenge: OnChallenge =
+                Box::new(|_challenge| Box::pin(async { ChallengeAction::Approve }));
+
+            let client = ClientBuilder::new(reqwest::Client::new())
+                .with(PaymentMiddleware::new(provider.clone()).with_on_challenge(on_challenge))
+                .build();
+
+            let resp = client
+                .get(format!("{}/paid", base_url))
+                .send()
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), reqwest::StatusCode::OK);
+            assert_eq!(provider.call_count(), 1);
+        }
+
+        #[tokio::test]
+        async fn test_middleware_on_challenge_credential() {
+            let (challenge, www_auth) = test_challenge();
+            let app = paid_app(www_auth);
+            let base_url = spawn_server(app).await;
+            let provider = TestProvider::new();
+
+            let echo = challenge.to_echo();
+            let on_challenge: OnChallenge = Box::new(move |_challenge| {
+                let echo = echo.clone();
+                Box::pin(async move {
+                    let cred = PaymentCredential::new(echo, PaymentPayload::hash("0xcustom"));
+                    ChallengeAction::Credential(Box::new(cred))
+                })
+            });
+
+            let client = ClientBuilder::new(reqwest::Client::new())
+                .with(PaymentMiddleware::new(provider.clone()).with_on_challenge(on_challenge))
+                .build();
+
+            let resp = client
+                .get(format!("{}/paid", base_url))
+                .send()
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), reqwest::StatusCode::OK);
+            assert_eq!(provider.call_count(), 0); // provider was NOT called
+        }
+
+        #[tokio::test]
+        async fn test_middleware_on_challenge_decline() {
+            let (_, www_auth) = test_challenge();
+            let app = paid_app(www_auth);
+            let base_url = spawn_server(app).await;
+            let provider = TestProvider::new();
+
+            let on_challenge: OnChallenge =
+                Box::new(|_challenge| Box::pin(async { ChallengeAction::Decline }));
+
+            let client = ClientBuilder::new(reqwest::Client::new())
+                .with(PaymentMiddleware::new(provider.clone()).with_on_challenge(on_challenge))
+                .build();
+
+            let err = client
+                .get(format!("{}/paid", base_url))
+                .send()
+                .await
+                .unwrap_err();
+
+            assert!(
+                err.to_string().contains("payment declined"),
+                "expected payment declined error, got: {}",
+                err
+            );
+            assert_eq!(provider.call_count(), 0);
         }
     }
 }
