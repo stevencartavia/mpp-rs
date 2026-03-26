@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.8.0 (2026-03-26)
+
+### Minor Changes
+
+- Added a Stripe Shared Payment Token (SPT) example demonstrating the full 402 → challenge → credential → retry flow using Stripe's payment method. Includes a server with SPT proxy endpoint and a headless client using a test card. (by @stevencartavia, [#162](https://github.com/stevencartavia/mpp-rs/pull/162))
+- Added Stripe payment method support (`method="stripe"`, `intent="charge"`) with client-side `StripeProvider` for SPT creation, server-side `ChargeMethod` for PaymentIntent verification, and `Mpp::create_stripe()` builder integration. Added `stripe` and `integration-stripe` feature flags backed by `reqwest`. (by @stevencartavia, [#162](https://github.com/stevencartavia/mpp-rs/pull/162))
+
+### Patch Changes
+
+- Bumped `alloy` dependency from 1.7 to 1.8 and `tempo-alloy`/`tempo-primitives` from 1 to 1.5 across the main crate and all examples. (by @stevencartavia, [#162](https://github.com/stevencartavia/mpp-rs/pull/162))
+- Fixed `base64url_decode` to accept standard base64 (`+`, `/`, `=` padding) in addition to URL-safe base64, following Postel's law and aligning with the mppx TypeScript SDK behavior. Added tests covering standard base64 with padding, URL-safe without padding, and standard alphabet without padding in both `types.rs` and `headers.rs`. (by @stevencartavia, [#162](https://github.com/stevencartavia/mpp-rs/pull/162))
+
 ## 0.7.0 (2026-03-23)
 
 ### Minor Changes
