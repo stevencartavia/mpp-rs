@@ -9,7 +9,9 @@ use reqwest::{Request, Response, StatusCode};
 use reqwest_middleware::{Middleware, Next};
 
 use crate::client::provider::PaymentProvider;
-use crate::protocol::core::{format_authorization, parse_www_authenticate, AUTHORIZATION_HEADER};
+use crate::protocol::core::{
+    format_authorization, parse_www_authenticate_all, AUTHORIZATION_HEADER,
+};
 
 /// Middleware that automatically handles 402 Payment Required responses.
 ///
@@ -66,17 +68,24 @@ where
             .context("request could not be cloned for payment retry")
             .map_err(reqwest_middleware::Error::Middleware)?;
 
-        let www_auth = resp
+        let www_auth_headers: Vec<&str> = resp
             .headers()
-            .get(WWW_AUTHENTICATE)
-            .context("402 response missing WWW-Authenticate header")
-            .map_err(reqwest_middleware::Error::Middleware)?
-            .to_str()
-            .context("invalid WWW-Authenticate header")
-            .map_err(reqwest_middleware::Error::Middleware)?;
+            .get_all(WWW_AUTHENTICATE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
 
-        let challenge = parse_www_authenticate(www_auth)
-            .context("invalid challenge")
+        if www_auth_headers.is_empty() {
+            return Err(reqwest_middleware::Error::Middleware(anyhow::anyhow!(
+                "402 response missing WWW-Authenticate header"
+            )));
+        }
+
+        let challenge = parse_www_authenticate_all(www_auth_headers)
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .find(|c| self.provider.supports(c.method.as_str(), c.intent.as_str()))
+            .context("no supported payment challenge")
             .map_err(reqwest_middleware::Error::Middleware)?;
 
         let credential = self

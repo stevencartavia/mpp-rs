@@ -257,14 +257,17 @@ pub fn parse_www_authenticate(header: &str) -> Result<PaymentChallenge> {
 
 /// Parse all WWW-Authenticate headers that use the Payment scheme.
 ///
-/// Returns a Vec of Results - one for each Payment header found.
-/// Non-Payment headers are skipped.
+/// Returns a Vec of Results - one for each Payment challenge found.
+/// Non-Payment headers are skipped. Handles both separate header lines
+/// and multiple `Payment` schemes merged into a single comma-separated
+/// header value.
 ///
 /// # Examples
 ///
 /// ```
 /// use mpp::protocol::core::parse_www_authenticate_all;
 ///
+/// // Separate header lines
 /// let headers = vec![
 ///     "Bearer token",
 ///     "Payment id=\"abc\", realm=\"api\", method=\"tempo\", intent=\"charge\", request=\"e30\"",
@@ -272,18 +275,86 @@ pub fn parse_www_authenticate(header: &str) -> Result<PaymentChallenge> {
 /// ];
 /// let challenges = parse_www_authenticate_all(headers);
 /// assert_eq!(challenges.len(), 2);
+///
+/// // Merged into a single header value
+/// let merged = vec![
+///     "Payment id=\"abc\", realm=\"api\", method=\"tempo\", intent=\"charge\", request=\"e30\", Payment id=\"def\", realm=\"api\", method=\"base\", intent=\"charge\", request=\"e30\"",
+/// ];
+/// let challenges = parse_www_authenticate_all(merged);
+/// assert_eq!(challenges.len(), 2);
 /// ```
 pub fn parse_www_authenticate_all<'a>(
     headers: impl IntoIterator<Item = &'a str>,
 ) -> Vec<Result<PaymentChallenge>> {
     headers
         .into_iter()
-        .filter(|h| {
-            h.trim_start()
-                .get(..8)
-                .is_some_and(|s| s.eq_ignore_ascii_case("payment "))
-        })
+        .flat_map(split_payment_schemes)
         .map(parse_www_authenticate)
+        .collect()
+}
+
+/// Split a header value that may contain multiple `Payment` schemes into
+/// individual scheme strings.
+///
+/// Uses a quote-aware scan so that `Payment` appearing inside quoted parameter
+/// values (e.g., inside a base64-encoded `request` field) is not treated as a
+/// scheme boundary.
+fn split_payment_schemes(header: &str) -> Vec<&str> {
+    let bytes = header.as_bytes();
+    let scheme = b"payment";
+    let mut starts: Vec<usize> = Vec::new();
+    let mut in_quotes = false;
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && in_quotes && i + 1 < bytes.len() {
+            i += 2; // skip escaped character inside quotes
+            continue;
+        }
+        if bytes[i] == b'"' {
+            in_quotes = !in_quotes;
+            i += 1;
+            continue;
+        }
+        if in_quotes {
+            i += 1;
+            continue;
+        }
+
+        // Check for case-insensitive "payment" followed by whitespace.
+        // Safety: outside of quoted strings `i` is always at an ASCII (single-byte)
+        // character boundary, because we only toggle `in_quotes` at ASCII `"` and
+        // advance past ASCII `\` escapes, so `header[..i]` never splits a UTF-8 seq.
+        if i + scheme.len() < bytes.len()
+            && bytes[i..i + scheme.len()].eq_ignore_ascii_case(scheme)
+            && bytes[i + scheme.len()].is_ascii_whitespace()
+        {
+            // Accept at the very start, after leading whitespace, or after a comma.
+            let before = header[..i].trim();
+            if before.is_empty() || before.ends_with(',') {
+                starts.push(i);
+                i += scheme.len();
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    if starts.is_empty() {
+        return Vec::new();
+    }
+
+    starts
+        .iter()
+        .enumerate()
+        .map(|(idx, &start)| {
+            let end = if idx + 1 < starts.len() {
+                starts[idx + 1]
+            } else {
+                bytes.len()
+            };
+            header[start..end].trim_end_matches(|c: char| c == ',' || c.is_whitespace())
+        })
         .collect()
 }
 
@@ -548,6 +619,37 @@ mod tests {
 
         let second = results[1].as_ref().unwrap();
         assert_eq!(second.id, "b");
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_all_merged() {
+        // Two Payment schemes in a single comma-separated header value
+        let merged = r#"Payment id="a", realm="api", method="tempo", intent="charge", request="e30", Payment id="b", realm="api", method="stripe", intent="charge", request="e30""#;
+        let results = parse_www_authenticate_all(vec![merged]);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].as_ref().unwrap().id, "a");
+        assert_eq!(results[0].as_ref().unwrap().method.as_str(), "tempo");
+        assert_eq!(results[1].as_ref().unwrap().id, "b");
+        assert_eq!(results[1].as_ref().unwrap().method.as_str(), "stripe");
+    }
+
+    #[test]
+    fn test_split_payment_schemes_ignores_quoted() {
+        // "Payment" inside a quoted value should NOT be treated as a boundary
+        let header = r#"Payment id="a", realm="api", method="tempo", intent="charge", request="e30", description="Payment required""#;
+        let schemes = split_payment_schemes(header);
+        assert_eq!(schemes.len(), 1);
+    }
+
+    #[test]
+    fn test_split_payment_schemes_leading_whitespace() {
+        // Headers with leading whitespace must still be recognized
+        let header =
+            r#"  Payment id="a", realm="api", method="tempo", intent="charge", request="e30""#;
+        let schemes = split_payment_schemes(header);
+        assert_eq!(schemes.len(), 1);
+        let challenge = parse_www_authenticate(schemes[0]).unwrap();
+        assert_eq!(challenge.id, "a");
     }
 
     #[test]
