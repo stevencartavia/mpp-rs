@@ -8,7 +8,7 @@ use reqwest::header::WWW_AUTHENTICATE;
 use reqwest::{Request, Response, StatusCode};
 use reqwest_middleware::{Middleware, Next};
 
-use crate::client::fetch::{ChallengeAction, OnChallenge};
+use crate::client::fetch::{ApproveChallenge, ChallengeAction, OnChallenge};
 use crate::client::provider::PaymentProvider;
 use crate::protocol::core::{
     format_authorization, parse_www_authenticate_all, AUTHORIZATION_HEADER,
@@ -36,9 +36,9 @@ use crate::protocol::core::{
 /// // All requests through this client automatically handle 402
 /// let resp = client.get("https://api.example.com/paid").send().await?;
 /// ```
-pub struct PaymentMiddleware<P> {
+pub struct PaymentMiddleware<P, H = ApproveChallenge> {
     provider: P,
-    on_challenge: Option<OnChallenge>,
+    on_challenge: H,
 }
 
 impl<P> PaymentMiddleware<P> {
@@ -46,26 +46,31 @@ impl<P> PaymentMiddleware<P> {
     pub fn new(provider: P) -> Self {
         Self {
             provider,
-            on_challenge: None,
+            on_challenge: ApproveChallenge,
         }
     }
+}
 
-    /// Set an [`OnChallenge`] callback invoked before payment execution.
+impl<P, H> PaymentMiddleware<P, H> {
+    /// Set an [`OnChallenge`] hook invoked before payment execution.
     ///
-    /// The callback returns a [`ChallengeAction`] controlling how to proceed:
+    /// The hook returns a [`ChallengeAction`] controlling how to proceed:
     /// - [`ChallengeAction::Approve`] — auto-pay via the provider
     /// - [`ChallengeAction::Credential`] — use the provided credential directly
     /// - [`ChallengeAction::Decline`] — abort with a middleware error
-    pub fn with_on_challenge(mut self, on_challenge: OnChallenge) -> Self {
-        self.on_challenge = Some(on_challenge);
-        self
+    pub fn with_on_challenge<H2: OnChallenge>(self, on_challenge: H2) -> PaymentMiddleware<P, H2> {
+        PaymentMiddleware {
+            provider: self.provider,
+            on_challenge,
+        }
     }
 }
 
 #[async_trait]
-impl<P> Middleware for PaymentMiddleware<P>
+impl<P, H> Middleware for PaymentMiddleware<P, H>
 where
     P: PaymentProvider + 'static,
+    H: OnChallenge + 'static,
 {
     async fn handle(
         &self,
@@ -108,27 +113,19 @@ where
             .context("no challenge matches provider's supported methods")
             .map_err(reqwest_middleware::Error::Middleware)?;
 
-        let credential = if let Some(ref cb) = self.on_challenge {
-            match cb(challenge).await {
-                ChallengeAction::Approve => self
-                    .provider
-                    .pay(challenge)
-                    .await
-                    .context("payment failed")
-                    .map_err(reqwest_middleware::Error::Middleware)?,
-                ChallengeAction::Credential(c) => *c,
-                ChallengeAction::Decline => {
-                    return Err(reqwest_middleware::Error::Middleware(anyhow::anyhow!(
-                        "payment declined by on_challenge callback"
-                    )))
-                }
-            }
-        } else {
-            self.provider
+        let credential = match self.on_challenge.on_challenge(challenge).await {
+            ChallengeAction::Approve => self
+                .provider
                 .pay(challenge)
                 .await
                 .context("payment failed")
-                .map_err(reqwest_middleware::Error::Middleware)?
+                .map_err(reqwest_middleware::Error::Middleware)?,
+            ChallengeAction::Credential(c) => *c,
+            ChallengeAction::Decline => {
+                return Err(reqwest_middleware::Error::Middleware(anyhow::anyhow!(
+                    "payment declined by on_challenge callback"
+                )))
+            }
         };
 
         let auth_header = format_authorization(&credential)
@@ -416,11 +413,10 @@ mod tests {
             let base_url = spawn_server(app).await;
             let provider = TestProvider::new();
 
-            let on_challenge: OnChallenge =
-                Box::new(|_challenge| Box::pin(async { ChallengeAction::Approve }));
+            let approve = |_: &PaymentChallenge| async { ChallengeAction::Approve };
 
             let client = ClientBuilder::new(reqwest::Client::new())
-                .with(PaymentMiddleware::new(provider.clone()).with_on_challenge(on_challenge))
+                .with(PaymentMiddleware::new(provider.clone()).with_on_challenge(approve))
                 .build();
 
             let resp = client
@@ -441,13 +437,13 @@ mod tests {
             let provider = TestProvider::new();
 
             let echo = challenge.to_echo();
-            let on_challenge: OnChallenge = Box::new(move |_challenge| {
+            let on_challenge = move |_challenge: &PaymentChallenge| {
                 let echo = echo.clone();
-                Box::pin(async move {
+                async move {
                     let cred = PaymentCredential::new(echo, PaymentPayload::hash("0xcustom"));
                     ChallengeAction::Credential(Box::new(cred))
-                })
-            });
+                }
+            };
 
             let client = ClientBuilder::new(reqwest::Client::new())
                 .with(PaymentMiddleware::new(provider.clone()).with_on_challenge(on_challenge))
@@ -470,11 +466,10 @@ mod tests {
             let base_url = spawn_server(app).await;
             let provider = TestProvider::new();
 
-            let on_challenge: OnChallenge =
-                Box::new(|_challenge| Box::pin(async { ChallengeAction::Decline }));
+            let decline = |_: &PaymentChallenge| async { ChallengeAction::Decline };
 
             let client = ClientBuilder::new(reqwest::Client::new())
-                .with(PaymentMiddleware::new(provider.clone()).with_on_challenge(on_challenge))
+                .with(PaymentMiddleware::new(provider.clone()).with_on_challenge(decline))
                 .build();
 
             let err = client

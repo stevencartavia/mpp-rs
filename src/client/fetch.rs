@@ -5,7 +5,6 @@
 use reqwest::header::WWW_AUTHENTICATE;
 use reqwest::{RequestBuilder, Response, StatusCode};
 use std::future::Future;
-use std::pin::Pin;
 
 use super::error::HttpError;
 use super::provider::PaymentProvider;
@@ -29,45 +28,48 @@ pub enum ChallengeAction {
     Decline,
 }
 
-/// Callback invoked when a 402 challenge is received, before executing payment.
+/// Hook invoked when a 402 challenge is received, before executing payment.
 ///
-/// The callback receives the parsed [`PaymentChallenge`] and returns a
-/// [`ChallengeAction`] controlling how to proceed.
+/// Returns a [`ChallengeAction`] controlling how to proceed.
 ///
-/// # Examples
+/// Implement this trait on a custom type, or use closures directly:
 ///
 /// ```ignore
-/// use mpp::client::{Fetch, OnChallenge, ChallengeAction};
+/// use mpp::client::{Fetch, ChallengeAction};
 ///
-/// // Simple approval gate
-/// let on_challenge: OnChallenge = Box::new(|challenge| {
-///     Box::pin(async move {
-///         if approve_payment(challenge).await {
-///             ChallengeAction::Approve
-///         } else {
-///             ChallengeAction::Decline
-///         }
-///     })
-/// });
-///
-/// // Or supply a credential directly (e.g. after gathering user input)
-/// let on_challenge: OnChallenge = Box::new(|challenge| {
-///     Box::pin(async move {
-///         let credential = create_credential_with_extra_context(challenge).await;
-///         ChallengeAction::Credential(Box::new(credential))
-///     })
-/// });
-///
+/// let gate = |_challenge| async { ChallengeAction::Approve };
 /// let resp = client
 ///     .get("https://api.example.com/paid")
-///     .send_with_payment_opts(&provider, Some(&on_challenge))
+///     .send_with_payment_opts(&provider, &gate)
 ///     .await?;
 /// ```
-pub type OnChallenge = Box<
-    dyn Fn(&PaymentChallenge) -> Pin<Box<dyn Future<Output = ChallengeAction> + Send + '_>>
-        + Send
-        + Sync,
->;
+pub trait OnChallenge: Send + Sync {
+    /// Decide how to handle a 402 payment challenge.
+    fn on_challenge<'a>(
+        &'a self,
+        challenge: &'a PaymentChallenge,
+    ) -> impl Future<Output = ChallengeAction> + Send + 'a;
+}
+
+/// No-op [`OnChallenge`] that always approves. Used as the default by
+/// [`send_with_payment`](PaymentExt::send_with_payment).
+pub struct ApproveChallenge;
+
+impl OnChallenge for ApproveChallenge {
+    async fn on_challenge(&self, _challenge: &PaymentChallenge) -> ChallengeAction {
+        ChallengeAction::Approve
+    }
+}
+
+impl<F, Fut> OnChallenge for F
+where
+    F: Fn(&PaymentChallenge) -> Fut + Send + Sync,
+    Fut: Future<Output = ChallengeAction> + Send + 'static,
+{
+    async fn on_challenge(&self, challenge: &PaymentChallenge) -> ChallengeAction {
+        (self)(challenge).await
+    }
+}
 
 /// Extension trait for `reqwest::RequestBuilder` with payment support.
 ///
@@ -110,16 +112,16 @@ pub trait PaymentExt {
     ) -> impl std::future::Future<Output = Result<Response, HttpError>> + Send;
 
     /// Like [`send_with_payment`](PaymentExt::send_with_payment), but with an
-    /// optional [`OnChallenge`] callback invoked before payment execution.
+    /// [`OnChallenge`] hook invoked before payment execution.
     ///
-    /// The callback returns a [`ChallengeAction`] controlling how to proceed:
+    /// The hook returns a [`ChallengeAction`] controlling how to proceed:
     /// - [`ChallengeAction::Approve`] — auto-pay via the provider
     /// - [`ChallengeAction::Credential`] — use the provided credential directly
     /// - [`ChallengeAction::Decline`] — abort with [`HttpError::PaymentDeclined`]
-    fn send_with_payment_opts<P: PaymentProvider>(
+    fn send_with_payment_opts<P: PaymentProvider, H: OnChallenge>(
         self,
         provider: &P,
-        on_challenge: Option<&OnChallenge>,
+        on_challenge: &H,
     ) -> impl std::future::Future<Output = Result<Response, HttpError>> + Send;
 }
 
@@ -128,13 +130,14 @@ impl PaymentExt for RequestBuilder {
         self,
         provider: &P,
     ) -> Result<Response, HttpError> {
-        self.send_with_payment_opts(provider, None).await
+        self.send_with_payment_opts(provider, &ApproveChallenge)
+            .await
     }
 
-    async fn send_with_payment_opts<P: PaymentProvider>(
+    async fn send_with_payment_opts<P: PaymentProvider, H: OnChallenge>(
         self,
         provider: &P,
-        on_challenge: Option<&OnChallenge>,
+        on_challenge: &H,
     ) -> Result<Response, HttpError> {
         let retry_builder = self.try_clone().ok_or(HttpError::CloneFailed)?;
 
@@ -174,14 +177,10 @@ impl PaymentExt for RequestBuilder {
                 ))
             })?;
 
-        let credential = if let Some(cb) = on_challenge {
-            match cb(challenge).await {
-                ChallengeAction::Approve => provider.pay(challenge).await?,
-                ChallengeAction::Credential(c) => *c,
-                ChallengeAction::Decline => return Err(HttpError::PaymentDeclined),
-            }
-        } else {
-            provider.pay(challenge).await?
+        let credential = match on_challenge.on_challenge(challenge).await {
+            ChallengeAction::Approve => provider.pay(challenge).await?,
+            ChallengeAction::Credential(c) => *c,
+            ChallengeAction::Decline => return Err(HttpError::PaymentDeclined),
         };
 
         let auth_header = format_authorization(&credential)
@@ -692,12 +691,11 @@ mod tests {
             let base_url = spawn_server(app).await;
             let provider = MockProvider::new();
 
-            let on_challenge: super::OnChallenge =
-                Box::new(|_challenge| Box::pin(async { super::ChallengeAction::Approve }));
+            let approve = |_: &PaymentChallenge| async { super::ChallengeAction::Approve };
 
             let resp = reqwest::Client::new()
                 .get(format!("{}/paid", base_url))
-                .send_with_payment_opts(&provider, Some(&on_challenge))
+                .send_with_payment_opts(&provider, &approve)
                 .await
                 .unwrap();
 
@@ -713,17 +711,17 @@ mod tests {
             let provider = MockProvider::new();
 
             let echo = challenge.to_echo();
-            let on_challenge: super::OnChallenge = Box::new(move |_challenge| {
+            let on_challenge = move |_challenge: &PaymentChallenge| {
                 let echo = echo.clone();
-                Box::pin(async move {
+                async move {
                     let cred = PaymentCredential::new(echo, PaymentPayload::hash("0xcustom"));
                     super::ChallengeAction::Credential(Box::new(cred))
-                })
-            });
+                }
+            };
 
             let resp = reqwest::Client::new()
                 .get(format!("{}/paid", base_url))
-                .send_with_payment_opts(&provider, Some(&on_challenge))
+                .send_with_payment_opts(&provider, &on_challenge)
                 .await
                 .unwrap();
 
@@ -738,12 +736,11 @@ mod tests {
             let base_url = spawn_server(app).await;
             let provider = MockProvider::new();
 
-            let on_challenge: super::OnChallenge =
-                Box::new(|_challenge| Box::pin(async { super::ChallengeAction::Decline }));
+            let decline = |_: &PaymentChallenge| async { super::ChallengeAction::Decline };
 
             let err = reqwest::Client::new()
                 .get(format!("{}/paid", base_url))
-                .send_with_payment_opts(&provider, Some(&on_challenge))
+                .send_with_payment_opts(&provider, &decline)
                 .await
                 .unwrap_err();
 
