@@ -120,10 +120,9 @@ fn parse_auth_params(params_str: &str) -> Result<HashMap<String, String>> {
             i += 1;
         }
         if i >= chars.len() || chars[i] != '=' {
-            while i < chars.len() && !chars[i].is_whitespace() && chars[i] != ',' {
-                i += 1;
-            }
-            continue;
+            // A bare token without '=' is the start of a new auth scheme
+            // (per RFC 9110, auth-params are always key=value).
+            break;
         }
 
         let key: String = chars[key_start..i].iter().collect();
@@ -650,6 +649,29 @@ mod tests {
         assert_eq!(schemes.len(), 1);
         let challenge = parse_www_authenticate(schemes[0]).unwrap();
         assert_eq!(challenge.id, "a");
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_all_payment_followed_by_other_scheme() {
+        // Payment followed by a non-Payment scheme in the same header value
+        let header = r#"Payment id="a", realm="api", method="tempo", intent="charge", request="e30", Basic realm="login""#;
+        let results = parse_www_authenticate_all(vec![header]);
+        assert_eq!(results.len(), 1);
+        let challenge = results[0].as_ref().unwrap();
+        assert_eq!(challenge.id, "a");
+        assert_eq!(challenge.method.as_str(), "tempo");
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_all_mixed_schemes_merged() {
+        // Payment + non-Payment + Payment in a single merged header
+        let header = r#"Payment id="a", realm="api", method="tempo", intent="charge", request="e30", Bearer token, Payment id="b", realm="api", method="stripe", intent="charge", request="e30""#;
+        let results = parse_www_authenticate_all(vec![header]);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].as_ref().unwrap().id, "a");
+        assert_eq!(results[0].as_ref().unwrap().method.as_str(), "tempo");
+        assert_eq!(results[1].as_ref().unwrap().id, "b");
+        assert_eq!(results[1].as_ref().unwrap().method.as_str(), "stripe");
     }
 
     #[test]
