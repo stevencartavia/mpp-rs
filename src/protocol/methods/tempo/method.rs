@@ -24,7 +24,7 @@
 //! ```
 
 use alloy::network::ReceiptResponse;
-use alloy::primitives::{hex, keccak256, Address, Bytes, TxKind, B256, U256};
+use alloy::primitives::{keccak256, Address, Bytes, TxKind, B256, U256};
 use alloy::providers::Provider;
 use alloy::sol_types::SolCall;
 use std::future::Future;
@@ -36,6 +36,7 @@ use crate::protocol::core::{PaymentCredential, Receipt};
 use crate::protocol::intents::ChargeRequest;
 use crate::protocol::traits::{ChargeMethod as ChargeMethodTrait, VerificationError};
 use crate::store::Store;
+use crate::tempo::attribution;
 
 use super::transfers::{get_request_transfers, Transfer};
 use super::{TempoChargeExt, CHAIN_ID, INTENT_CHARGE, METHOD_NAME};
@@ -175,17 +176,231 @@ fn validate_fee_payer_calls(
 
     Ok(())
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatchedTransferLog {
+    Transfer,
+    Memo([u8; 32]),
+}
 
-/// Parse a hex string (with or without 0x prefix) into a B256.
-fn parse_b256_hex(s: &str) -> Option<B256> {
-    let s = s.strip_prefix("0x").unwrap_or(s);
-    hex::decode(s).ok().and_then(|bytes| {
-        if bytes.len() == 32 {
-            Some(B256::from_slice(&bytes))
-        } else {
-            None
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParsedTransferLog {
+    Transfer {
+        address: Address,
+        amount: U256,
+        from: Address,
+        to: Address,
+    },
+    Memo {
+        address: Address,
+        amount: U256,
+        from: Address,
+        memo: [u8; 32],
+        to: Address,
+    },
+}
+
+impl ParsedTransferLog {
+    fn address(&self) -> Address {
+        match self {
+            Self::Transfer { address, .. } | Self::Memo { address, .. } => *address,
         }
-    })
+    }
+
+    fn amount(&self) -> U256 {
+        match self {
+            Self::Transfer { amount, .. } | Self::Memo { amount, .. } => *amount,
+        }
+    }
+
+    fn from(&self) -> Address {
+        match self {
+            Self::Transfer { from, .. } | Self::Memo { from, .. } => *from,
+        }
+    }
+
+    fn matched(&self) -> MatchedTransferLog {
+        match self {
+            Self::Transfer { .. } => MatchedTransferLog::Transfer,
+            Self::Memo { memo, .. } => MatchedTransferLog::Memo(*memo),
+        }
+    }
+
+    fn memo(&self) -> Option<[u8; 32]> {
+        match self {
+            Self::Transfer { .. } => None,
+            Self::Memo { memo, .. } => Some(*memo),
+        }
+    }
+
+    fn to(&self) -> Address {
+        match self {
+            Self::Transfer { to, .. } | Self::Memo { to, .. } => *to,
+        }
+    }
+}
+
+fn parse_receipt_transfer_log(log: &serde_json::Value) -> Option<ParsedTransferLog> {
+    let address = log
+        .get("address")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<Address>().ok())?;
+
+    let topics: Vec<&str> = log
+        .get("topics")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())?;
+    if topics.len() < 3 {
+        return None;
+    }
+
+    let topic0 = topics[0].parse::<B256>().ok()?;
+    let from = topics[1]
+        .parse::<B256>()
+        .ok()
+        .map(|b| Address::from_slice(&b[12..]))?;
+    let to = topics[2]
+        .parse::<B256>()
+        .ok()
+        .map(|b| Address::from_slice(&b[12..]))?;
+
+    let data = log.get("data").and_then(|v| v.as_str()).unwrap_or("0x");
+    if topic0 == TRANSFER_EVENT_TOPIC {
+        if data.len() < 66 {
+            return None;
+        }
+
+        let amount = U256::from_str_radix(&data[2..66], 16).ok()?;
+        return Some(ParsedTransferLog::Transfer {
+            address,
+            amount,
+            from,
+            to,
+        });
+    }
+
+    if topic0 == TRANSFER_WITH_MEMO_EVENT_TOPIC {
+        if topics.len() < 4 || data.len() < 66 {
+            return None;
+        }
+
+        let amount = U256::from_str_radix(&data[2..66], 16).ok()?;
+        let memo = topics[3].parse::<B256>().ok().map(|bytes| bytes.0)?;
+        return Some(ParsedTransferLog::Memo {
+            address,
+            amount,
+            from,
+            memo,
+            to,
+        });
+    }
+
+    None
+}
+
+fn match_receipt_transfer_logs(
+    logs: &[serde_json::Value],
+    tx_sender: Address,
+    currency: Address,
+    expected: &[Transfer],
+) -> Result<Vec<MatchedTransferLog>, VerificationError> {
+    let mut sorted_expected: Vec<(usize, &Transfer)> = expected.iter().enumerate().collect();
+    sorted_expected.sort_by_key(|(_, t)| if t.memo.is_some() { 0 } else { 1 });
+
+    let parsed_logs: Vec<Option<ParsedTransferLog>> =
+        logs.iter().map(parse_receipt_transfer_log).collect();
+    let mut used_logs: Vec<bool> = vec![false; logs.len()];
+    let mut matched_logs = Vec::with_capacity(expected.len());
+
+    for (_, transfer) in &sorted_expected {
+        if transfer.amount.is_zero() {
+            return Err(VerificationError::new(
+                "Invalid amount: expected_amount must be greater than zero".to_string(),
+            ));
+        }
+        if transfer.recipient.is_zero() {
+            return Err(VerificationError::new(
+                "Invalid recipient: expected_recipient cannot be the zero address".to_string(),
+            ));
+        }
+
+        let find_match = |prefer_memo: bool| {
+            for (log_idx, parsed) in parsed_logs.iter().enumerate() {
+                if used_logs[log_idx] {
+                    continue;
+                }
+
+                let Some(parsed) = parsed else {
+                    continue;
+                };
+
+                if parsed.address() != currency
+                    || parsed.from() != tx_sender
+                    || parsed.to() != transfer.recipient
+                    || parsed.amount() != transfer.amount
+                {
+                    continue;
+                }
+
+                if let Some(exp_memo) = transfer.memo {
+                    if parsed.memo() != Some(exp_memo) {
+                        continue;
+                    }
+                } else if prefer_memo != parsed.memo().is_some() {
+                    continue;
+                }
+
+                return Some((log_idx, parsed.matched()));
+            }
+
+            None
+        };
+
+        let matched = if transfer.memo.is_some() {
+            find_match(true)
+        } else {
+            find_match(true).or_else(|| find_match(false))
+        };
+
+        let Some((log_idx, matched_log)) = matched else {
+            return Err(VerificationError::new(format!(
+                "No matching transfer event found for {} to {}{}",
+                transfer.amount,
+                transfer.recipient,
+                if transfer.memo.is_some() {
+                    " with memo"
+                } else {
+                    ""
+                }
+            )));
+        };
+
+        used_logs[log_idx] = true;
+        matched_logs.push(matched_log);
+    }
+
+    Ok(matched_logs)
+}
+
+fn assert_challenge_bound_memo(
+    matched_logs: &[MatchedTransferLog],
+    challenge_id: &str,
+    realm: &str,
+) -> Result<(), VerificationError> {
+    let bound = matched_logs.iter().any(|log| match log {
+        MatchedTransferLog::Transfer => false,
+        MatchedTransferLog::Memo(memo) => {
+            attribution::verify_server(memo, realm)
+                && attribution::verify_challenge_binding(memo, challenge_id)
+        }
+    });
+
+    if bound {
+        Ok(())
+    } else {
+        Err(VerificationError::new(
+            "Payment verification failed: memo is not bound to this challenge.",
+        ))
+    }
 }
 
 /// Tempo charge method for one-time payment verification.
@@ -280,6 +495,8 @@ where
         &self,
         tx_hash: &str,
         charge: &ChargeRequest,
+        challenge_id: &str,
+        realm: &str,
     ) -> Result<Receipt, VerificationError> {
         let hash = tx_hash
             .parse::<B256>()
@@ -326,7 +543,11 @@ where
         let expected = Self::expected_transfers(charge)?;
 
         // Tempo uses TIP-20 tokens exclusively (no native token transfers)
-        self.verify_tip20_transfers(&receipt, currency, &expected)?;
+        let matched_logs = self.verify_tip20_transfers(&receipt, currency, &expected)?;
+
+        if charge.memo().is_none() {
+            assert_challenge_bound_memo(&matched_logs, challenge_id, realm)?;
+        }
 
         if let Some(store) = &self.store {
             store
@@ -348,7 +569,7 @@ where
         receipt: &<TempoNetwork as alloy::network::Network>::ReceiptResponse,
         currency: Address,
         expected: &[Transfer],
-    ) -> Result<(), VerificationError> {
+    ) -> Result<Vec<MatchedTransferLog>, VerificationError> {
         let receipt_json = serde_json::to_value(receipt)
             .map_err(|e| VerificationError::new(format!("Failed to serialize receipt: {}", e)))?;
 
@@ -359,137 +580,7 @@ where
             .and_then(|v| v.as_array())
             .ok_or_else(|| VerificationError::new("Receipt has no logs".to_string()))?;
 
-        // Sort expected transfers: memo-bearing first for greedy-safe matching
-        let mut sorted_expected: Vec<(usize, &Transfer)> = expected.iter().enumerate().collect();
-        sorted_expected.sort_by_key(|(_, t)| if t.memo.is_some() { 0 } else { 1 });
-
-        let mut used_logs: Vec<bool> = vec![false; logs.len()];
-
-        for (_, transfer) in &sorted_expected {
-            if transfer.amount.is_zero() {
-                return Err(VerificationError::new(
-                    "Invalid amount: expected_amount must be greater than zero".to_string(),
-                ));
-            }
-            if transfer.recipient.is_zero() {
-                return Err(VerificationError::new(
-                    "Invalid recipient: expected_recipient cannot be the zero address".to_string(),
-                ));
-            }
-
-            let mut found = false;
-            for (log_idx, log) in logs.iter().enumerate() {
-                if used_logs[log_idx] {
-                    continue;
-                }
-
-                let log_address = log
-                    .get("address")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse::<Address>().ok());
-                if log_address != Some(currency) {
-                    continue;
-                }
-
-                let topics: Vec<&str> = log
-                    .get("topics")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
-                    .unwrap_or_default();
-                if topics.is_empty() {
-                    continue;
-                }
-
-                let topic0 = match topics[0].parse::<B256>() {
-                    Ok(t) => t,
-                    Err(_) => continue,
-                };
-
-                if let Some(exp_memo) = &transfer.memo {
-                    let exp_memo = B256::from(*exp_memo);
-                    if topic0 == TRANSFER_WITH_MEMO_EVENT_TOPIC && topics.len() >= 3 {
-                        let from_address = match topics[1].parse::<B256>() {
-                            Ok(b) => Address::from_slice(&b[12..]),
-                            Err(_) => continue,
-                        };
-                        if from_address != tx_sender {
-                            continue;
-                        }
-                        let to_address = match topics[2].parse::<B256>() {
-                            Ok(b) => Address::from_slice(&b[12..]),
-                            Err(_) => continue,
-                        };
-                        if to_address != transfer.recipient {
-                            continue;
-                        }
-                        let data = log.get("data").and_then(|v| v.as_str()).unwrap_or("0x");
-                        if data.len() >= 130 {
-                            let amount = match U256::from_str_radix(&data[2..66], 16) {
-                                Ok(a) => a,
-                                Err(_) => continue,
-                            };
-                            let memo_bytes = match parse_b256_hex(&data[66..130]) {
-                                Some(m) => m,
-                                None => continue,
-                            };
-                            if amount == transfer.amount && memo_bytes == exp_memo {
-                                used_logs[log_idx] = true;
-                                found = true;
-                                break;
-                            }
-                        }
-                    }
-                } else if (topic0 == TRANSFER_EVENT_TOPIC
-                    || topic0 == TRANSFER_WITH_MEMO_EVENT_TOPIC)
-                    && topics.len() >= 3
-                {
-                    // No memo expected — accept both Transfer and TransferWithMemo events,
-                    // matching only by recipient and amount (consistent with
-                    // validate_transaction_transfers).
-                    let from_address = match topics[1].parse::<B256>() {
-                        Ok(b) => Address::from_slice(&b[12..]),
-                        Err(_) => continue,
-                    };
-                    if from_address != tx_sender {
-                        continue;
-                    }
-                    let to_address = match topics[2].parse::<B256>() {
-                        Ok(b) => Address::from_slice(&b[12..]),
-                        Err(_) => continue,
-                    };
-                    if to_address != transfer.recipient {
-                        continue;
-                    }
-                    let data = log.get("data").and_then(|v| v.as_str()).unwrap_or("0x");
-                    if data.len() >= 66 {
-                        let amount = match U256::from_str_radix(&data[2..66], 16) {
-                            Ok(a) => a,
-                            Err(_) => continue,
-                        };
-                        if amount == transfer.amount {
-                            used_logs[log_idx] = true;
-                            found = true;
-                            break;
-                        }
-                    }
-                }
-            }
-
-            if !found {
-                return Err(VerificationError::new(format!(
-                    "No matching transfer event found for {} to {}{}",
-                    transfer.amount,
-                    transfer.recipient,
-                    if transfer.memo.is_some() {
-                        " with memo"
-                    } else {
-                        ""
-                    }
-                )));
-            }
-        }
-
-        Ok(())
+        match_receipt_transfer_logs(logs, tx_sender, currency, expected)
     }
 
     /// Validate that a transaction contains all expected payment calls (supports splits).
@@ -928,8 +1019,13 @@ where
 
             if charge_payload.is_hash() {
                 // Client already broadcast the transaction, verify by hash
-                this.verify_hash(charge_payload.tx_hash().unwrap(), &request)
-                    .await
+                this.verify_hash(
+                    charge_payload.tx_hash().unwrap(),
+                    &request,
+                    &credential.challenge.id,
+                    &credential.challenge.realm,
+                )
+                .await
             } else {
                 // Client sent signed transaction, validate and broadcast it.
                 // broadcast_transaction already does pre-broadcast dedup and
@@ -950,6 +1046,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::hex;
+
     use super::{super::MODERATO_CHAIN_ID, *};
 
     #[test]
@@ -962,40 +1060,6 @@ mod tests {
     fn test_transfer_with_memo_selector() {
         // transferWithMemo(address,uint256,bytes32) = 0x95777d59
         assert_eq!(TRANSFER_WITH_MEMO_SELECTOR, [0x95, 0x77, 0x7d, 0x59]);
-    }
-
-    #[test]
-    fn test_parse_b256_hex_valid() {
-        let valid = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
-        let result = parse_b256_hex(valid);
-        assert!(result.is_some());
-
-        // Without 0x prefix
-        let valid_no_prefix = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
-        let result = parse_b256_hex(valid_no_prefix);
-        assert!(result.is_some());
-    }
-
-    #[test]
-    fn test_parse_b256_hex_invalid_length() {
-        // Too short (only 3 bytes)
-        let too_short = "0xabcdef";
-        assert!(parse_b256_hex(too_short).is_none());
-
-        // Too long (33 bytes)
-        let too_long = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef00";
-        assert!(parse_b256_hex(too_long).is_none());
-
-        // Empty
-        assert!(parse_b256_hex("").is_none());
-        assert!(parse_b256_hex("0x").is_none());
-    }
-
-    #[test]
-    fn test_parse_b256_hex_invalid_chars() {
-        // Invalid hex characters
-        let invalid = "0xgggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg";
-        assert!(parse_b256_hex(invalid).is_none());
     }
 
     #[test]
@@ -1016,21 +1080,6 @@ mod tests {
                 "57bc7354aa85aed339e000bccffabbc529466af35f0772c8f8ee1145927de7f0"
             )
         );
-    }
-
-    #[test]
-    fn test_parse_b256_hex_case_insensitive() {
-        // Test case insensitivity - both should parse to the same value
-        let lower = "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
-        let upper = "0xABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890";
-        let mixed = "0xAbCdEf1234567890AbCdEf1234567890AbCdEf1234567890AbCdEf1234567890";
-
-        let lower_result = parse_b256_hex(lower).unwrap();
-        let upper_result = parse_b256_hex(upper).unwrap();
-        let mixed_result = parse_b256_hex(mixed).unwrap();
-
-        assert_eq!(lower_result, upper_result);
-        assert_eq!(lower_result, mixed_result);
     }
 
     #[test]
@@ -1192,6 +1241,177 @@ mod tests {
             signer.sign_hash_sync(&tx.signature_hash()).unwrap().into();
 
         tx.into_signed(signature).encoded_2718()
+    }
+
+    fn address_topic(address: Address) -> String {
+        format!("0x{:0>64}", hex::encode(address.as_slice()))
+    }
+
+    fn amount_data(amount: U256) -> String {
+        let mut amount_bytes = [0u8; 32];
+        amount.to_be_bytes::<32>().clone_into(&mut amount_bytes);
+        hex::encode(amount_bytes)
+    }
+
+    fn make_transfer_log(
+        currency: Address,
+        from: Address,
+        to: Address,
+        amount: U256,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "address": format!("{:#x}", currency),
+            "topics": [
+                format!("{:#x}", TRANSFER_EVENT_TOPIC),
+                address_topic(from),
+                address_topic(to),
+            ],
+            "data": format!("0x{}", amount_data(amount)),
+        })
+    }
+
+    fn make_transfer_with_memo_log(
+        currency: Address,
+        from: Address,
+        to: Address,
+        amount: U256,
+        memo: [u8; 32],
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "address": format!("{:#x}", currency),
+            "topics": [
+                format!("{:#x}", TRANSFER_WITH_MEMO_EVENT_TOPIC),
+                address_topic(from),
+                address_topic(to),
+                format!("0x{}", hex::encode(memo)),
+            ],
+            "data": format!("0x{}", amount_data(amount)),
+        })
+    }
+
+    #[test]
+    fn test_match_receipt_transfer_logs_prefers_memo_logs() {
+        let currency = Address::repeat_byte(0x20);
+        let sender = Address::repeat_byte(0x11);
+        let recipient = Address::repeat_byte(0x33);
+        let amount = U256::from(100u64);
+        let memo = attribution::encode("challenge-123", "api.example.com", None);
+        let logs = vec![
+            make_transfer_log(currency, sender, recipient, amount),
+            make_transfer_with_memo_log(currency, sender, recipient, amount, memo),
+        ];
+        let expected = vec![Transfer {
+            amount,
+            recipient,
+            memo: None,
+        }];
+
+        let matched = match_receipt_transfer_logs(&logs, sender, currency, &expected).unwrap();
+
+        assert_eq!(matched, vec![MatchedTransferLog::Memo(memo)]);
+    }
+
+    #[test]
+    fn test_match_receipt_transfer_logs_with_split_preserves_bound_memo() {
+        let currency = Address::repeat_byte(0x20);
+        let sender = Address::repeat_byte(0x11);
+        let primary = Address::repeat_byte(0x33);
+        let split = Address::repeat_byte(0x44);
+        let memo = attribution::encode("challenge-123", "api.example.com", None);
+        let logs = vec![
+            make_transfer_log(currency, sender, split, U256::from(10u64)),
+            make_transfer_with_memo_log(currency, sender, primary, U256::from(90u64), memo),
+        ];
+        let expected = vec![
+            Transfer {
+                amount: U256::from(90u64),
+                recipient: primary,
+                memo: None,
+            },
+            Transfer {
+                amount: U256::from(10u64),
+                recipient: split,
+                memo: None,
+            },
+        ];
+
+        let matched = match_receipt_transfer_logs(&logs, sender, currency, &expected).unwrap();
+
+        assert_eq!(matched.len(), 2);
+        assert!(matched.contains(&MatchedTransferLog::Memo(memo)));
+        assert!(matched.contains(&MatchedTransferLog::Transfer));
+    }
+
+    #[test]
+    fn test_assert_challenge_bound_memo_accepts_bound_memo() {
+        let memo = attribution::encode("challenge-123", "api.example.com", None);
+
+        assert!(assert_challenge_bound_memo(
+            &[MatchedTransferLog::Memo(memo)],
+            "challenge-123",
+            "api.example.com",
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_assert_challenge_bound_memo_rejects_plain_transfer() {
+        let error = assert_challenge_bound_memo(
+            &[MatchedTransferLog::Transfer],
+            "challenge-123",
+            "api.example.com",
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("memo is not bound to this challenge"));
+    }
+
+    #[test]
+    fn test_assert_challenge_bound_memo_rejects_wrong_challenge() {
+        let memo = attribution::encode("challenge-123", "api.example.com", None);
+
+        let error = assert_challenge_bound_memo(
+            &[MatchedTransferLog::Memo(memo)],
+            "challenge-456",
+            "api.example.com",
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("memo is not bound to this challenge"));
+    }
+
+    #[test]
+    fn test_assert_challenge_bound_memo_rejects_non_mpp_memo() {
+        let error = assert_challenge_bound_memo(
+            &[MatchedTransferLog::Memo([0x11; 32])],
+            "challenge-123",
+            "api.example.com",
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("memo is not bound to this challenge"));
+    }
+
+    #[test]
+    fn test_assert_challenge_bound_memo_rejects_wrong_realm() {
+        let memo = attribution::encode("challenge-123", "api.example.com", None);
+
+        let error = assert_challenge_bound_memo(
+            &[MatchedTransferLog::Memo(memo)],
+            "challenge-123",
+            "other.example.com",
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("memo is not bound to this challenge"));
     }
 
     /// Helper: sign a tx and encode as a 0x78 fee payer envelope.
