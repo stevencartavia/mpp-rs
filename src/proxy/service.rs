@@ -253,7 +253,19 @@ impl ProxyConfig {
         let stripped = self.strip_base(path)?;
 
         if stripped == "/llms.txt" {
-            return Some(DiscoveryResponse::LlmsTxt(to_llms_txt(&self.services)));
+            let open_api_path = match &self.base_path {
+                Some(base) => format!("{}/openapi.json", base.trim_end_matches('/')),
+                None => "/openapi.json".to_string(),
+            };
+            let options = LlmsTxtOptions {
+                title: self.title.as_deref(),
+                description: self.description.as_deref(),
+                open_api_path: Some(&open_api_path),
+            };
+            return Some(DiscoveryResponse::LlmsTxt(to_llms_txt_with(
+                &self.services,
+                Some(&options),
+            )));
         }
 
         if stripped == "/services" || stripped == "/services/" {
@@ -372,71 +384,52 @@ fn serialize_payment(endpoint: &Endpoint) -> Value {
     }
 }
 
+/// Options for customizing llms.txt output.
+pub struct LlmsTxtOptions<'a> {
+    /// Override the default title.
+    pub title: Option<&'a str>,
+    /// Override the default description.
+    pub description: Option<&'a str>,
+    /// Path to the OpenAPI discovery document (default: "/openapi.json").
+    pub open_api_path: Option<&'a str>,
+}
+
 /// Generate llms.txt content for LLM-friendly service discovery.
 pub fn to_llms_txt(services: &[Service]) -> String {
+    to_llms_txt_with(services, None)
+}
+
+/// Generate llms.txt content with optional title/description overrides.
+pub fn to_llms_txt_with(services: &[Service], options: Option<&LlmsTxtOptions<'_>>) -> String {
+    let title = options.and_then(|o| o.title).unwrap_or("API Proxy");
+    let description = options
+        .and_then(|o| o.description)
+        .unwrap_or("Paid API proxy powered by [Machine Payments Protocol](https://mpp.tempo.xyz).");
+    let open_api_path = options
+        .and_then(|o| o.open_api_path)
+        .unwrap_or("/openapi.json");
+
     let mut lines = vec![
-        "# API Proxy".to_string(),
+        format!("# {title}"),
         String::new(),
-        "> Paid API proxy powered by [Machine Payments Protocol](https://mpp.tempo.xyz)."
-            .to_string(),
-        String::new(),
-        "For machine-readable service data, use `GET /services` (JSON).".to_string(),
+        format!("> {description}"),
         String::new(),
     ];
 
-    if services.is_empty() {
-        return lines.join("\n");
-    }
-
-    lines.push("## Services".to_string());
-    lines.push(String::new());
-    for s in services {
-        let free = s
-            .routes
-            .iter()
-            .filter(|r| matches!(r.endpoint, Endpoint::Free))
-            .count();
-        let paid = s.routes.len() - free;
-        let mut parts = Vec::new();
-        if paid > 0 {
-            parts.push(format!("{paid} paid"));
-        }
-        if free > 0 {
-            parts.push(format!("{free} free"));
-        }
-        lines.push(format!(
-            "- [{}]({}): {}",
-            s.id,
-            s.base_url,
-            parts.join(", ")
-        ));
-    }
-
-    for s in services {
+    if !services.is_empty() {
+        lines.push("## Services".to_string());
         lines.push(String::new());
-        lines.push(format!("## {}", s.id));
-        lines.push(String::new());
-        for route in &s.routes {
-            match &route.endpoint {
-                Endpoint::Free => {
-                    lines.push(format!("- `{}`: Free", route.pattern));
-                }
-                Endpoint::Paid(p) => {
-                    let mut parts = vec![p.intent.clone()];
-                    let unit = format!("{} units", p.amount);
-                    if let Some(ref ut) = p.unit_type {
-                        parts.push(format!("{unit} per {ut}"));
-                    } else {
-                        parts.push(unit);
-                    }
-                    if let Some(ref desc) = p.description {
-                        parts.push(format!("\"{desc}\""));
-                    }
-                    lines.push(format!("- `{}`: {}", route.pattern, parts.join(" — ")));
-                }
+        for s in services {
+            let label = s.title.as_deref().unwrap_or(&s.id);
+            match &s.description {
+                Some(desc) => lines.push(format!("- {label}: {desc}")),
+                None => lines.push(format!("- {label}")),
             }
         }
+        lines.push(String::new());
     }
+
+    lines.push(format!("[OpenAPI discovery]({open_api_path})"));
 
     lines.join("\n")
 }
@@ -633,10 +626,8 @@ mod tests {
         assert!(resp.is_some());
         if let Some(DiscoveryResponse::LlmsTxt(txt)) = resp {
             assert!(txt.contains("# API Proxy"));
-            assert!(txt.contains("openai"));
-            assert!(txt.contains("1 paid"));
-            assert!(txt.contains("1 free"));
-            assert!(txt.contains("Chat completion"));
+            assert!(txt.contains("- openai"));
+            assert!(txt.contains("[OpenAPI discovery](/openapi.json)"));
         }
     }
 
@@ -670,22 +661,16 @@ mod tests {
     }
 
     #[test]
-    fn test_llms_txt_empty() {
-        let txt = to_llms_txt(&[]);
-        assert!(txt.contains("# API Proxy"));
-        assert!(!txt.contains("## Services"));
-    }
-
-    #[test]
     fn test_llms_txt_with_services() {
         let services = vec![test_service()];
         let txt = to_llms_txt(&services);
+        assert!(txt.contains("# API Proxy"));
         assert!(txt.contains("## Services"));
-        assert!(txt.contains("- [openai](https://api.openai.com): 1 paid, 1 free"));
-        assert!(txt.contains("## openai"));
-        assert!(txt.contains("`POST /v1/chat/completions`: charge"));
-        assert!(txt.contains("50000 units"));
-        assert!(txt.contains("`GET /v1/models`: Free"));
+        assert!(txt.contains("- openai"));
+        assert!(txt.contains("[OpenAPI discovery](/openapi.json)"));
+        // No per-route details (matches mppx toLlmsTxt)
+        assert!(!txt.contains("charge"));
+        assert!(!txt.contains("50000"));
     }
 
     #[test]
@@ -734,5 +719,61 @@ mod tests {
         let v = serialize_service(&svc);
         assert_eq!(v["title"], "Test Service");
         assert_eq!(v["description"], "A test service");
+    }
+
+    #[test]
+    fn test_to_llms_txt_with_custom_title_description() {
+        let svc = Service::new("openai", "https://api.openai.com")
+            .title("OpenAI")
+            .description("Chat completions and embeddings.")
+            .route("GET /v1/models", Endpoint::Free)
+            .build();
+        let options = LlmsTxtOptions {
+            title: Some("My AI Gateway"),
+            description: Some("A paid proxy for LLM and AI services."),
+            open_api_path: None,
+        };
+        let txt = to_llms_txt_with(std::slice::from_ref(&svc), Some(&options));
+        assert!(txt.contains("# My AI Gateway"));
+        assert!(txt.contains("> A paid proxy for LLM and AI services."));
+        assert!(!txt.contains("# API Proxy"));
+        // title fallback: service title used over id
+        assert!(txt.contains("- OpenAI: Chat completions and embeddings."));
+        // default openapi link
+        assert!(txt.contains("[OpenAPI discovery](/openapi.json)"));
+    }
+
+    #[test]
+    fn test_to_llms_txt_defaults() {
+        let txt = to_llms_txt(&[]);
+        assert!(txt.contains("# API Proxy"));
+        assert!(txt.contains("[OpenAPI discovery](/openapi.json)"));
+        assert!(!txt.contains("## Services"));
+
+        // custom openapi path
+        let options = LlmsTxtOptions {
+            title: None,
+            description: None,
+            open_api_path: Some("/api/proxy/openapi.json"),
+        };
+        let txt = to_llms_txt_with(&[], Some(&options));
+        assert!(txt.contains("[OpenAPI discovery](/api/proxy/openapi.json)"));
+    }
+
+    #[test]
+    fn test_discovery_llms_txt_custom_title() {
+        let config = ProxyConfig {
+            base_path: None,
+            services: vec![test_service()],
+            title: Some("My Gateway".to_string()),
+            description: Some("Custom description.".to_string()),
+        };
+        let resp = config.handle_discovery("GET", "/llms.txt");
+        if let Some(DiscoveryResponse::LlmsTxt(txt)) = resp {
+            assert!(txt.contains("# My Gateway"));
+            assert!(txt.contains("> Custom description."));
+        } else {
+            panic!("expected LlmsTxt");
+        }
     }
 }
