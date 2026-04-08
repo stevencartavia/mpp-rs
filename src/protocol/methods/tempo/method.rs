@@ -31,6 +31,7 @@ use std::future::Future;
 use std::sync::Arc;
 use tempo_alloy::contracts::precompiles::{IStablecoinDEX, ITIP20, STABLECOIN_DEX_ADDRESS};
 use tempo_alloy::TempoNetwork;
+use tokio::sync::OnceCell;
 
 use crate::protocol::core::{PaymentCredential, Receipt};
 use crate::protocol::intents::ChargeRequest;
@@ -444,6 +445,7 @@ pub struct ChargeMethod<P> {
     provider: Arc<P>,
     fee_payer_signer: Option<Arc<alloy::signers::local::PrivateKeySigner>>,
     store: Option<Arc<dyn Store>>,
+    cached_chain_id: Arc<OnceCell<u64>>,
 }
 
 impl<P> ChargeMethod<P>
@@ -459,6 +461,7 @@ where
             provider: Arc::new(provider),
             fee_payer_signer: None,
             store: None,
+            cached_chain_id: Arc::new(OnceCell::new()),
         }
     }
 
@@ -977,12 +980,14 @@ where
         let provider = Arc::clone(&self.provider);
         let fee_payer_signer = self.fee_payer_signer.clone();
         let store = self.store.clone();
+        let cached_chain_id = Arc::clone(&self.cached_chain_id);
 
         async move {
             let this = ChargeMethod {
                 provider,
                 fee_payer_signer,
                 store,
+                cached_chain_id,
             };
 
             if credential.challenge.method.as_str() != METHOD_NAME {
@@ -999,9 +1004,14 @@ where
             }
 
             let expected_chain_id = request.chain_id().unwrap_or(CHAIN_ID);
-            let actual_chain_id = this.provider.get_chain_id().await.map_err(|e| {
-                VerificationError::network_error(format!("Failed to fetch chain ID: {}", e))
-            })?;
+            let actual_chain_id = *this
+                .cached_chain_id
+                .get_or_try_init(|| async {
+                    this.provider.get_chain_id().await.map_err(|e| {
+                        VerificationError::network_error(format!("Failed to fetch chain ID: {}", e))
+                    })
+                })
+                .await?;
 
             if actual_chain_id != expected_chain_id {
                 return Err(VerificationError::chain_id_mismatch(format!(
@@ -2167,5 +2177,85 @@ mod tests {
         // Original hash should still be blocked
         let seen = store.get("mpp:charge:0xhash_a").await.unwrap();
         assert!(seen.is_some(), "original hash should still be recorded");
+    }
+
+    // ==================== Chain ID caching tests ====================
+
+    #[test]
+    fn test_charge_method_new_has_empty_chain_id_cache() {
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let method = ChargeMethod::new(provider);
+        assert!(
+            method.cached_chain_id.get().is_none(),
+            "cache should be empty on construction"
+        );
+    }
+
+    #[test]
+    fn test_charge_method_clone_shares_chain_id_cache() {
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let method = ChargeMethod::new(provider);
+
+        // Pre-populate the cache
+        method.cached_chain_id.set(42431).unwrap();
+
+        // Clone shares the same Arc<OnceCell>
+        let cloned = method.clone();
+        assert_eq!(
+            cloned.cached_chain_id.get(),
+            Some(&42431),
+            "clone should share the cached chain ID"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cached_chain_id_survives_across_verify_calls() {
+        // Verify that the OnceCell is shared across the ChargeMethod's
+        // internal clones in the verify() async block.
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let method = ChargeMethod::new(provider);
+
+        // First call will fail (can't reach RPC) but the cache should remain empty
+        let request = test_charge_request_with_amount("0");
+        let challenge = test_proof_challenge(&request);
+        let credential = PaymentCredential::new(
+            challenge.to_echo(),
+            crate::protocol::core::PaymentPayload::hash("0xdeadbeef"),
+        );
+        let _ = method.verify(&credential, &request).await;
+
+        // Cache should still be empty because the RPC call failed
+        assert!(
+            method.cached_chain_id.get().is_none(),
+            "failed RPC should not populate cache"
+        );
+
+        // Manually populate the cache to simulate a successful first call
+        method.cached_chain_id.set(42431).unwrap();
+
+        // Subsequent access should return the cached value
+        assert_eq!(method.cached_chain_id.get(), Some(&42431));
+    }
+
+    #[tokio::test]
+    async fn test_cached_chain_id_oncecell_rejects_second_init() {
+        // OnceCell should reject a second initialization attempt,
+        // ensuring the cached value is immutable after first set.
+        let cell = Arc::new(OnceCell::new());
+        cell.set(42431).unwrap();
+
+        let result = cell.set(9999);
+        assert!(result.is_err(), "OnceCell should reject second set");
+        assert_eq!(
+            cell.get(),
+            Some(&42431),
+            "original value should be retained"
+        );
     }
 }
