@@ -74,8 +74,8 @@ impl FeePayerEnvelope78 {
             access_list: tx.access_list,
             nonce_key: tx.nonce_key,
             nonce: tx.nonce,
-            valid_before: tx.valid_before,
-            valid_after: tx.valid_after,
+            valid_before: tx.valid_before.map(|v| v.get()),
+            valid_after: tx.valid_after.map(|v| v.get()),
             fee_token: tx.fee_token,
             sender,
             tempo_authorization_list: tx.tempo_authorization_list,
@@ -133,8 +133,8 @@ impl FeePayerEnvelope78 {
                 U256::ZERO,
                 false,
             )),
-            valid_before: self.valid_before,
-            valid_after: self.valid_after,
+            valid_before: self.valid_before.and_then(std::num::NonZeroU64::new),
+            valid_after: self.valid_after.and_then(std::num::NonZeroU64::new),
             key_authorization: self.key_authorization.clone(),
             tempo_authorization_list: self.tempo_authorization_list.clone(),
         };
@@ -336,7 +336,7 @@ mod tests {
                 U256::ZERO,
                 false,
             )),
-            valid_before: Some(9999999999),
+            valid_before: std::num::NonZeroU64::new(9999999999),
             valid_after: None,
             tempo_authorization_list: vec![],
         }
@@ -355,7 +355,7 @@ mod tests {
             chain_id: 42431,
             key_type: SignatureType::Secp256k1,
             key_id: signer.address(),
-            expiry: Some(9999999999),
+            expiry: std::num::NonZeroU64::new(9999999999),
             limits: Some(vec![TokenLimit {
                 token: Address::repeat_byte(0x33),
                 limit: U256::from(1_000_000u64),
@@ -411,7 +411,7 @@ mod tests {
     fn roundtrip_with_valid_before_and_after() {
         let signer = test_signer();
         let mut tx = base_fee_payer_tx();
-        tx.valid_after = Some(1000);
+        tx.valid_after = std::num::NonZeroU64::new(1000);
 
         let env = sign_envelope(tx, &signer);
         assert!(env.valid_before.is_some());
@@ -434,7 +434,7 @@ mod tests {
     fn roundtrip_all_optionals_set() {
         let signer = test_signer();
         let mut tx = base_fee_payer_tx();
-        tx.valid_after = Some(500);
+        tx.valid_after = std::num::NonZeroU64::new(500);
         tx.fee_token = Some(Address::repeat_byte(0x55));
 
         let env = sign_envelope(tx, &signer);
@@ -459,7 +459,7 @@ mod tests {
     fn roundtrip_with_key_authorization_and_all_optionals() {
         let signer = test_signer();
         let mut tx = base_fee_payer_tx();
-        tx.valid_after = Some(42);
+        tx.valid_after = std::num::NonZeroU64::new(42);
         tx.fee_token = Some(Address::repeat_byte(0x66));
         tx.key_authorization = Some(make_signed_key_auth(&signer));
 

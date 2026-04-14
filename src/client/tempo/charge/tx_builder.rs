@@ -67,7 +67,7 @@ pub fn build_tempo_tx(options: TempoTxOptions) -> TempoTransaction {
         } else {
             None
         },
-        valid_before: options.valid_before,
+        valid_before: options.valid_before.and_then(std::num::NonZeroU64::new),
         valid_after: None,
         tempo_authorization_list: vec![],
     }
@@ -300,7 +300,7 @@ mod tests {
             chain_id: 42431,
             key_type: SignatureType::Secp256k1,
             key_id: signer.address(),
-            expiry: Some(9999999999),
+            expiry: std::num::NonZeroU64::new(9999999999),
             limits: None,
             allowed_calls: None,
         };

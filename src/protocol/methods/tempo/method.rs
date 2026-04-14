@@ -915,7 +915,7 @@ where
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_err(|e| VerificationError::new(format!("System clock error: {e}")))?
                     .as_secs();
-                if vb <= now {
+                if vb.get() <= now {
                     return Err(VerificationError::new(format!(
                         "Fee payer envelope expired: valid_before ({vb}) is not in the future (now={now})"
                     )));
@@ -1336,7 +1336,7 @@ mod tests {
                 U256::ZERO,
                 false,
             )),
-            valid_before: Some(now + valid_before_secs_from_now),
+            valid_before: std::num::NonZeroU64::new(now + valid_before_secs_from_now),
             valid_after: None,
             calls: vec![tempo_primitives::transaction::Call {
                 to: TxKind::Call(Address::repeat_byte(0x20)),
@@ -2036,7 +2036,7 @@ mod tests {
             - 10;
 
         let mut tx = make_fee_payer_tx(60);
-        tx.valid_before = Some(past);
+        tx.valid_before = std::num::NonZeroU64::new(past);
 
         let encoded = sign_and_encode_0x78(tx, &client_signer);
 

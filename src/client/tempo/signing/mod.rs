@@ -324,7 +324,7 @@ mod tests {
             chain_id: 42431,
             key_type: SignatureType::Secp256k1,
             key_id: signer.address(),
-            expiry: Some(9999999999),
+            expiry: std::num::NonZeroU64::new(9999999999),
             limits: None,
             allowed_calls: None,
         };
@@ -368,7 +368,7 @@ mod tests {
         let mut tx = test_tx();
         tx.fee_token = None;
         tx.nonce_key = alloy::primitives::U256::MAX;
-        tx.valid_before = Some(9999999999);
+        tx.valid_before = std::num::NonZeroU64::new(9999999999);
         tx.fee_payer_signature = Some(alloy::primitives::Signature::new(
             alloy::primitives::U256::ZERO,
             alloy::primitives::U256::ZERO,
@@ -399,7 +399,7 @@ mod tests {
         let mut tx = test_tx();
         tx.fee_token = None;
         tx.nonce_key = alloy::primitives::U256::MAX;
-        tx.valid_before = Some(9999999999);
+        tx.valid_before = std::num::NonZeroU64::new(9999999999);
         tx.fee_payer_signature = Some(alloy::primitives::Signature::new(
             alloy::primitives::U256::ZERO,
             alloy::primitives::U256::ZERO,
@@ -576,7 +576,7 @@ mod tests {
             chain_id: 42431,
             key_type: SignatureType::Secp256k1,
             key_id: signer.address(),
-            expiry: Some(9999999999),
+            expiry: std::num::NonZeroU64::new(9999999999),
             limits: None,
             allowed_calls: None,
         };
