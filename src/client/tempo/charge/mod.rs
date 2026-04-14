@@ -30,6 +30,8 @@
 
 pub mod tx_builder;
 
+use std::num::NonZeroU64;
+
 use alloy::primitives::{Address, TxKind, U256};
 use tempo_primitives::transaction::{Call, SignedKeyAuthorization};
 
@@ -323,7 +325,7 @@ impl TempoCharge {
             .with_fee_token(fee_token)
             .with_nonce_key(nonce_key);
 
-            if let Some(vb) = valid_before.and_then(std::num::NonZeroU64::new) {
+            if let Some(vb) = valid_before.and_then(NonZeroU64::new) {
                 req = req.with_valid_before(vb);
             }
 
