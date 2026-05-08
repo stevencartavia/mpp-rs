@@ -57,6 +57,14 @@ reqwest-default-tls = ["reqwest?/default-tls"]
 reqwest-native-tls = ["reqwest?/native-tls"]
 reqwest-rustls-tls = ["reqwest?/rustls"]
 
+# Preserve JSON object key insertion order in serde_json::Value::Object.
+# Without this feature, serde_json::Map is backed by BTreeMap and keys are
+# emitted in alphabetical order. Enabling this feature switches the backing
+# store to IndexMap and preserves insertion order. Off by default to avoid
+# unconditionally enabling serde_json/preserve_order on every workspace
+# member that depends on mpp (Cargo features are additive).
+preserve-order = ["serde_json/preserve_order"]
+
 # Integration tests (requires a running Tempo localnet)
 integration = ["tempo", "server", "client", "axum"]
 integration-ws = ["ws", "tempo", "server", "client", "axum"]
@@ -65,7 +73,7 @@ integration-stripe = ["stripe", "server", "client", "axum"]
 [dependencies]
 # Core dependencies (always included)
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+serde_json = "1"
 serde_json_canonicalizer = "0.3"
 thiserror = "2"
 time = { version = "0.3", features = ["formatting", "parsing"] }
