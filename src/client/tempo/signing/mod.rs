@@ -15,6 +15,7 @@ use alloy::primitives::{Address, U256};
 use tempo_primitives::transaction::{
     KeychainSignature, PrimitiveSignature, SignedKeyAuthorization, TempoSignature,
 };
+use tempo_primitives::TempoTxEnvelope;
 
 // Re-export so callers can set the version without importing tempo_primitives directly.
 pub use tempo_primitives::transaction::KeychainVersion;
@@ -344,6 +345,46 @@ pub async fn sign_and_encode_fee_payer_envelope_primitive_async(
         .mpp_http("failed to sign transaction")?;
     let signature = build_tempo_signature_primitive(signature, mode);
     Ok(FeePayerEnvelope78::from_signing_tx(tx, sender, signature).encoded_envelope())
+}
+
+/// Convert an Alloy-signed Tempo AA transaction to MPP's non-broadcastable
+/// fee-payer envelope.
+pub(crate) fn encode_signed_fee_payer_envelope(
+    envelope: TempoTxEnvelope,
+    sender: Address,
+) -> Result<Vec<u8>, MppError> {
+    let TempoTxEnvelope::AA(signed) = envelope else {
+        return Err(MppError::InvalidConfig(
+            "MPP fee sponsorship requires a Tempo AA transaction".into(),
+        ));
+    };
+    let (transaction, signature, _) = signed.into_parts();
+    if transaction.fee_payer_signature.is_none() {
+        return Err(MppError::InvalidConfig(
+            "fee payer envelope requires a fee_payer_signature placeholder".into(),
+        ));
+    }
+    if transaction.fee_token.is_some() {
+        return Err(MppError::InvalidConfig(
+            "fee payer envelope must not include fee_token".into(),
+        ));
+    }
+    if transaction.nonce_key != U256::MAX {
+        return Err(MppError::InvalidConfig(
+            "fee payer envelope must use the expiring nonce key".into(),
+        ));
+    }
+    if transaction.valid_before.is_none() {
+        return Err(MppError::InvalidConfig(
+            "fee payer envelope must include valid_before".into(),
+        ));
+    }
+    if transaction.access_list != AccessList::default() {
+        return Err(MppError::InvalidConfig(
+            "fee payer envelope must not include an access list".into(),
+        ));
+    }
+    Ok(FeePayerEnvelope78::from_signing_tx(transaction, sender, signature).encoded_envelope())
 }
 
 /// Async version of [`sign_and_encode_fee_payer_envelope`].
